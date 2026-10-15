@@ -190,3 +190,16 @@ func TestUnderSudoRootMapsToTheImagesOwner(t *testing.T) {
 	}
 	_ = os.Remove(filepath.Join(repo, "rootfs", "ubuntu", "root", "written"))
 }
+
+// ---------------------------------------------------------------- 04-uts ---
+
+func TestTheHostnameIsTheContainerID(t *testing.T) {
+	before, _ := os.Hostname()
+	r, _ := runAsUser(t, sh("hostname")...)
+	if !regexp.MustCompile(`^[0-9a-f]{12}$`).MatchString(strings.TrimSpace(r.stdout)) {
+		t.Errorf("hostname inside = %q, want the twelve-character container id\n%s", r.stdout, r.stderr)
+	}
+	if after, _ := os.Hostname(); after != before {
+		t.Fatalf("the host was renamed from %q to %q", before, after)
+	}
+}

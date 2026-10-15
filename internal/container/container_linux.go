@@ -49,12 +49,14 @@ func Run(image string, argv []string) (int, error) {
 	// refuses an unprivileged gid_map unless setgroups is denied first,
 	// and os/exec denies it when the field is false.
 	// snippet:start clone
-	cmd := exec.Command("/proc/self/exe", append([]string{ChildCommand, root}, argv...)...)
+	id := newID()
+	cmd := exec.Command("/proc/self/exe", append([]string{ChildCommand, id, root}, argv...)...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		// 01-pid: its own process IDs. 02-mnt: its own mount table.
-		// 03-user: its own user IDs, so no sudo.
-		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUSER,
+		// 03-user: its own user IDs, so no sudo. 04-uts: its own hostname.
+		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUSER |
+			syscall.CLONE_NEWUTS,
 		// One line each: root inside is the image's owner outside.
 		UidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: uid, Size: 1}},
 		GidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: gid, Size: 1}},
@@ -64,14 +66,21 @@ func Run(image string, argv []string) (int, error) {
 	return exitCode(cmd.Run())
 }
 
-// Child runs inside the new namespaces as PID 1. args is the rootfs path
-// and the command.
+// Child runs inside the new namespaces as PID 1. args is the container
+// ID, the rootfs path and the command.
 func Child(args []string) error {
 	logPID("child")
-	if len(args) < 2 {
-		return errors.New("child: want a rootfs and a command")
+	if len(args) < 3 {
+		return errors.New("child: want an id, a rootfs and a command")
 	}
-	root, argv := args[0], args[1:]
+	id, root, argv := args[0], args[1], args[2:]
+
+	// snippet:start hostname
+	// Only this container sees it, because of CLONE_NEWUTS.
+	if err := syscall.Sethostname([]byte(id)); err != nil {
+		return fmt.Errorf("sethostname: %w", err)
+	}
+	// snippet:end hostname
 
 	// snippet:start child-pivot
 	// The image becomes /, with its own /proc, /dev and /sys, and the
