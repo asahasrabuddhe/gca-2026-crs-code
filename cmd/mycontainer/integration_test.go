@@ -203,3 +203,29 @@ func TestTheHostnameIsTheContainerID(t *testing.T) {
 		t.Fatalf("the host was renamed from %q to %q", before, after)
 	}
 }
+
+// ---------------------------------------------------------------- 05-ipc ---
+
+func TestTheHostsSharedMemoryIsInvisible(t *testing.T) {
+	// The 2025 demo: make a segment on the host, then look for it inside.
+	out, err := exec.Command("ipcmk", "-M", "1024").Output()
+	if err != nil {
+		t.Fatalf("ipcmk: %v", err)
+	}
+	m := regexp.MustCompile(`id: (\d+)`).FindStringSubmatch(string(out))
+	if m == nil {
+		t.Fatalf("ipcmk said %q", out)
+	}
+	shmid := m[1]
+	defer exec.Command("ipcrm", "-m", shmid).Run()
+
+	r, _ := runAsUser(t, sh("ipcs -m")...)
+	if !strings.Contains(r.stdout, "Shared Memory Segments") {
+		t.Fatalf("ipcs did not run:\n%s%s", r.stdout, r.stderr)
+	}
+	for _, line := range strings.Split(r.stdout, "\n") {
+		if f := strings.Fields(line); len(f) > 1 && f[1] == shmid {
+			t.Errorf("the host's segment %s is visible inside:\n%s", shmid, r.stdout)
+		}
+	}
+}

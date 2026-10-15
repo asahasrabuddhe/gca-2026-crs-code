@@ -55,8 +55,9 @@ func Run(image string, argv []string) (int, error) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		// 01-pid: its own process IDs. 02-mnt: its own mount table.
 		// 03-user: its own user IDs, so no sudo. 04-uts: its own hostname.
+		// 05-ipc: its own shared memory, semaphores and message queues.
 		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUSER |
-			syscall.CLONE_NEWUTS,
+			syscall.CLONE_NEWUTS | syscall.CLONE_NEWIPC,
 		// One line each: root inside is the image's owner outside.
 		UidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: uid, Size: 1}},
 		GidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: gid, Size: 1}},
