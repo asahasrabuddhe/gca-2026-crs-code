@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -65,6 +66,21 @@ func wait(t *testing.T, cmd *exec.Cmd) result {
 		t.Fatalf("%v: %v\n%s", cmd.Args, err, errb.String())
 	}
 	return r
+}
+
+// runAsUser executes mycontainer as the user who ran sudo, with no
+// privileges at all. From 03-user that is how the talk runs it.
+func runAsUser(t *testing.T, args ...string) (result, int) {
+	t.Helper()
+	uid, err1 := strconv.Atoi(os.Getenv("SUDO_UID"))
+	gid, err2 := strconv.Atoi(os.Getenv("SUDO_GID"))
+	if err1 != nil || err2 != nil || uid == 0 {
+		t.Skip("run through sudo by an ordinary user: make test-root")
+	}
+	cmd := exec.Command(binary, args...)
+	cmd.Dir = repo
+	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}}
+	return wait(t, cmd), uid
 }
 
 // sh is `run ubuntu /bin/sh -c script`.
@@ -140,4 +156,37 @@ func TestAMissingImageIsAnError(t *testing.T) {
 	if r.code == 0 || !strings.Contains(r.stderr, "rootfs") {
 		t.Errorf("want a rootfs error, got code %d:\n%s", r.code, r.stderr)
 	}
+}
+
+// --------------------------------------------------------------- 03-user ---
+
+func TestRootInsideTheUserOutside(t *testing.T) {
+	r, uid := runAsUser(t, sh("id -u; cat /proc/self/uid_map")...)
+	if r.code != 0 {
+		t.Fatalf("no sudo, no container: code %d\n%s", r.code, r.stderr)
+	}
+	lines := strings.Split(strings.TrimSpace(r.stdout), "\n")
+	if len(lines) != 2 || lines[0] != "0" {
+		t.Fatalf("want uid 0 and a one-line map, got:\n%s", r.stdout)
+	}
+	if got := strings.Fields(lines[1]); len(got) != 3 || got[0] != "0" || got[1] != strconv.Itoa(uid) || got[2] != "1" {
+		t.Errorf("uid_map = %q, want 0 %d 1", lines[1], uid)
+	}
+}
+
+func TestUnderSudoRootMapsToTheImagesOwner(t *testing.T) {
+	// The image was pulled by the user, so it belongs to them. Container
+	// root maps to that owner, which is what lets root inside write to it.
+	var st syscall.Stat_t
+	if err := syscall.Stat(filepath.Join(repo, "rootfs", "ubuntu"), &st); err != nil {
+		t.Fatal(err)
+	}
+	r := run(t, sh("cat /proc/self/uid_map; touch /root/written && echo WROTE")...)
+	if f := strings.Fields(r.stdout); len(f) < 3 || f[1] != strconv.Itoa(int(st.Uid)) {
+		t.Errorf("uid_map does not map to the image's owner %d:\n%s", st.Uid, r.stdout)
+	}
+	if !strings.Contains(r.stdout, "WROTE") {
+		t.Errorf("root inside could not write to its own image:\n%s%s", r.stdout, r.stderr)
+	}
+	_ = os.Remove(filepath.Join(repo, "rootfs", "ubuntu", "root", "written"))
 }

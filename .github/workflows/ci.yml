@@ -67,6 +67,11 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.27"
+      # Ubuntu 23.10 and later only let AppArmor-profiled programs make an
+      # unprivileged user namespace. The VM's cloud-init lifts that, and so
+      # must CI, or every rootless tag fails at clone.
+      - name: allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: pull the image, as the runner user
         run: make rootfs
       - name: integration tests
