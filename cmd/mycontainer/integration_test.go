@@ -229,3 +229,57 @@ func TestTheHostsSharedMemoryIsInvisible(t *testing.T) {
 		}
 	}
 }
+
+// ------------------------------------------------------------ 06-cgroups ---
+
+func TestLimitsAreVisibleInside(t *testing.T) {
+	r := run(t, "run", "-memory", "64m", "-cpus", "0.5", "-pids", "20", "ubuntu", "/bin/sh", "-c",
+		"cat /proc/self/cgroup /sys/fs/cgroup/memory.max /sys/fs/cgroup/cpu.max /sys/fs/cgroup/pids.max")
+	// 0::/ is the cgroup namespace: the container's cgroup is its root.
+	for _, want := range []string{"0::/\n", "67108864\n", "50000 100000\n", "20\n"} {
+		if !strings.Contains(r.stdout, want) {
+			t.Errorf("missing %q in:\n%s%s", want, r.stdout, r.stderr)
+		}
+	}
+}
+
+func TestAForkBombIsRefused(t *testing.T) {
+	r := run(t, "run", "-pids", "20", "ubuntu", "/bin/sh", "-c", "for i in $(seq 40); do sleep 2 & done; wait")
+	if !strings.Contains(r.stderr, "Cannot fork") {
+		t.Errorf("fork was never refused:\n%s", r.stderr)
+	}
+}
+
+func TestAMemoryHogIsKilled(t *testing.T) {
+	// A 100 MB string in a 64 MB cgroup. The OOM killer takes the shell,
+	// and a death by SIGKILL is exit 137.
+	r := run(t, "run", "-memory", "64m", "ubuntu", "/bin/sh", "-c", "a=$(head -c 100000000 /dev/zero | tr '\\0' x); echo survived")
+	if strings.Contains(r.stdout, "survived") || r.code != 137 {
+		t.Errorf("the hog survived, code %d:\n%s", r.code, r.stdout)
+	}
+}
+
+func TestTheCgroupIsRemovedAfterExit(t *testing.T) {
+	sweep()
+	run(t, "run", "-pids", "20", "ubuntu", "/bin/true")
+	entries, err := os.ReadDir("/sys/fs/cgroup/mycontainer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			t.Errorf("leftover cgroup %s", e.Name())
+		}
+	}
+}
+
+// sweep removes cgroups an earlier, killed run left behind, so the test
+// judges only the container it runs.
+func sweep() {
+	entries, _ := os.ReadDir("/sys/fs/cgroup/mycontainer")
+	for _, e := range entries {
+		if e.IsDir() {
+			_ = os.Remove(filepath.Join("/sys/fs/cgroup/mycontainer", e.Name()))
+		}
+	}
+}

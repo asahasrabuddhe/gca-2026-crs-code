@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"go.ajitem.com/gca-crs/internal/cgroup"
 	"go.ajitem.com/gca-crs/internal/rootfs"
 )
 
@@ -28,7 +29,7 @@ import (
 const ChildCommand = "child"
 
 // Run is the parent. It returns the container's exit code.
-func Run(image string, argv []string) (int, error) {
+func Run(image string, argv []string, limits cgroup.Limits) (int, error) {
 	logPID("run")
 
 	root, err := rootfsPath(image)
@@ -45,22 +46,41 @@ func Run(image string, argv []string) (int, error) {
 		return 0, err
 	}
 
+	id := newID()
+
+	// snippet:start cgroup
+	// The cgroup exists before the child does, so the child is born in it
+	// and its very first fork already counts against pids.max.
+	group, err := createCgroup(id, limits)
+	if err != nil {
+		return 0, err
+	}
+	if group != nil {
+		defer group.Remove()
+	}
+	// snippet:end cgroup
+
 	// GidMappingsEnableSetgroups stays false, its default: the kernel
 	// refuses an unprivileged gid_map unless setgroups is denied first,
 	// and os/exec denies it when the field is false.
 	// snippet:start clone
-	id := newID()
 	cmd := exec.Command("/proc/self/exe", append([]string{ChildCommand, id, root}, argv...)...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		// 01-pid: its own process IDs. 02-mnt: its own mount table.
 		// 03-user: its own user IDs, so no sudo. 04-uts: its own hostname.
 		// 05-ipc: its own shared memory, semaphores and message queues.
+		// 06-cgroups: its own view of the cgroup tree, rooted at its own.
 		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUSER |
-			syscall.CLONE_NEWUTS | syscall.CLONE_NEWIPC,
+			syscall.CLONE_NEWUTS | syscall.CLONE_NEWIPC | syscall.CLONE_NEWCGROUP,
 		// One line each: root inside is the image's owner outside.
 		UidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: uid, Size: 1}},
 		GidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: gid, Size: 1}},
+	}
+	if group != nil {
+		// CLONE_INTO_CGROUP: clone3 puts the child straight into the cgroup.
+		cmd.SysProcAttr.UseCgroupFD = true
+		cmd.SysProcAttr.CgroupFD = group.FD
 	}
 	// snippet:end clone
 
@@ -99,6 +119,35 @@ func Child(args []string) error {
 		return err
 	}
 	return syscall.Exec(path, argv, os.Environ())
+}
+
+// createCgroup makes /sys/fs/cgroup/mycontainer/<id> and writes the
+// limits into it. As root it goes under the root cgroup. As an ordinary
+// user it has to go under the user's own, delegated cgroup, and if there is
+// none a container that asked for no limits runs without one, while one
+// that asked for limits is refused: a limit that silently did not apply is
+// worse than no container.
+func createCgroup(id string, limits cgroup.Limits) (*cgroup.Group, error) {
+	parent := "/"
+	if os.Geteuid() != 0 {
+		own, err := cgroup.OwnPath()
+		if err != nil {
+			return nil, err
+		}
+		parent = own
+	}
+	group, err := cgroup.Create(cgroup.Root, parent, id, limits)
+	if err != nil {
+		if len(limits.Files()) == 0 {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("cgroup: %w (limits need root, or a delegated cgroup)", err)
+	}
+	if err := group.Open(); err != nil {
+		_ = group.Remove()
+		return nil, err
+	}
+	return group, nil
 }
 
 // owner is the user and group that own the image. Container root maps to

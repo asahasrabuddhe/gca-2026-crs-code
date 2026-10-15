@@ -2,7 +2,7 @@
 
 // mycontainer: a container runtime, built one tag at a time.
 //
-//	mycontainer run <image> <command> [args...]
+//	mycontainer run [-memory 64m] [-cpus 0.5] [-pids 20] <image> <command> [args...]
 //
 // One binary, two roles. "run" is the parent, on the host. "child" is the
 // same binary started again inside the new namespaces; see package
@@ -23,12 +23,12 @@ func main() {
 
 	switch os.Args[1] {
 	case "run":
-		image, argv, err := parseRun(os.Args[2:])
+		o, err := parseRun(os.Args[2:])
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(2)
 		}
-		code, err := container.Run(image, argv)
+		code, err := container.Run(o.image, o.argv, o.limits)
 		if err != nil {
 			fail(err)
 		}
