@@ -106,10 +106,38 @@ func TestExitCodeComesBack(t *testing.T) {
 	}
 }
 
-func TestAPIDNamespaceAloneStillSeesTheHostsProc(t *testing.T) {
-	// The gotcha at this tag: new PIDs, but /proc is still the host's, so
-	// anything that reads it, ps included, sees every process on the box.
-	if n := count(t, run(t, sh("ls -d /proc/[0-9]* | wc -l")...).stdout); n < 10 {
-		t.Errorf("/proc lists %d processes; without a mount namespace it should be the host's many", n)
+// ---------------------------------------------------------------- 02-mnt ---
+
+func TestTheContainerHasItsOwnProc(t *testing.T) {
+	// A mount namespace, a fresh /proc mounted from inside the PID
+	// namespace, and /proc lists the container: the shell, ls and wc.
+	if n := count(t, run(t, sh("ls -d /proc/[0-9]* | wc -l")...).stdout); n > 5 {
+		t.Errorf("/proc lists %d processes; want only the container's own", n)
+	}
+}
+
+func TestTheHostFilesystemIsGone(t *testing.T) {
+	marker := filepath.Join("/tmp", "crs-host-marker-"+strconv.Itoa(os.Getpid()))
+	if err := os.WriteFile(marker, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(marker)
+
+	r := run(t, sh("test -e "+marker+" && echo HOST; test -e /.old_root && echo OLDROOT; cat /etc/os-release")...)
+	if strings.Contains(r.stdout, "HOST") {
+		t.Error("a file on the host's /tmp is visible inside")
+	}
+	if strings.Contains(r.stdout, "OLDROOT") {
+		t.Error("the old root's parking directory survived the pivot")
+	}
+	if !strings.Contains(r.stdout, "Ubuntu") {
+		t.Errorf("the rootfs is not the ubuntu image:\n%s", r.stdout)
+	}
+}
+
+func TestAMissingImageIsAnError(t *testing.T) {
+	r := run(t, "run", "no-such-image", "/bin/true")
+	if r.code == 0 || !strings.Contains(r.stderr, "rootfs") {
+		t.Errorf("want a rootfs error, got code %d:\n%s", r.code, r.stderr)
 	}
 }

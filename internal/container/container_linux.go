@@ -20,6 +20,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"syscall"
+
+	"go.ajitem.com/gca-crs/internal/rootfs"
 )
 
 // ChildCommand is the argv[1] the parent starts its own binary with.
@@ -33,14 +35,18 @@ func Run(image string, argv []string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	// Fail here, with a clear message, rather than as an EINVAL from
+	// pivot_root inside the child.
+	if err := rootfs.Validate(root); err != nil {
+		return 0, err
+	}
 
 	// snippet:start clone
 	cmd := exec.Command("/proc/self/exe", append([]string{ChildCommand, root}, argv...)...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		// The whole of 01-pid: the child gets its own process IDs, and the
-		// first process in it is PID 1.
-		Cloneflags: syscall.CLONE_NEWPID,
+		// 01-pid: its own process IDs. 02-mnt: its own mount table.
+		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS,
 	}
 	// snippet:end clone
 
@@ -48,13 +54,22 @@ func Run(image string, argv []string) (int, error) {
 }
 
 // Child runs inside the new namespaces as PID 1. args is the rootfs path
-// and the command; the rootfs is not used until 02-mnt.
+// and the command.
 func Child(args []string) error {
 	logPID("child")
 	if len(args) < 2 {
 		return errors.New("child: want a rootfs and a command")
 	}
-	argv := args[1:]
+	root, argv := args[0], args[1:]
+
+	// snippet:start child-pivot
+	// The image becomes /, with its own /proc, /dev and /sys, and the
+	// host's filesystem is detached. Only possible because of CLONE_NEWNS:
+	// without it, this would do the same to the host.
+	if err := rootfs.Pivot(rootfs.Linux{}, root); err != nil {
+		return err
+	}
+	// snippet:end child-pivot
 
 	// exec, not fork: the command replaces this process and so inherits
 	// PID 1, with everything that will mean later.
