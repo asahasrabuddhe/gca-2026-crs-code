@@ -1,133 +1,168 @@
 //go:build linux
 
-// Package container is the runtime: a parent that starts a child in new
-// namespaces, and the child that becomes the container.
+// Package container is the runtime: a parent that creates the cgroup and
+// clones the child into new namespaces, and a child that becomes PID 1,
+// pivots into the rootfs, drops capabilities and runs the command.
 //
-// They have to be two processes. Namespaces are a property of a process,
-// and the flags that create them are passed to clone(2), which makes a new
-// one. A Go program cannot move itself into a new PID namespace after the
-// fact: the runtime is already several threads by the time main runs, and
-// a new PID namespace only applies to children anyway. So the parent
-// starts its own binary again, through /proc/self/exe, with the clone
-// flags set, and that child is the container. runc does the same and calls
-// it runc init.
+// The two halves are two processes, and they have to be. Namespaces are a
+// property of a process, and the flags that create them are passed to
+// clone(2). A Go program cannot unshare itself into a PID namespace after
+// the fact, because the runtime is already multi-threaded by the time main
+// runs and a new PID namespace only takes effect for children anyway. So
+// the parent re-executes its own binary, /proc/self/exe, with the clone
+// flags set, and the child picks up where the parent left off. runc does
+// exactly this.
 package container
 
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
+	"os/signal"
+	"runtime"
 	"syscall"
 
+	"go.ajitem.com/gca-crs/internal/caps"
 	"go.ajitem.com/gca-crs/internal/cgroup"
+	"go.ajitem.com/gca-crs/internal/initproc"
 	"go.ajitem.com/gca-crs/internal/rootfs"
+	"go.ajitem.com/gca-crs/internal/spec"
 )
 
-// ChildCommand is the argv[1] the parent starts its own binary with.
+// ChildCommand is the argv[1] the parent re-executes itself with. Hidden
+// from the usage text on purpose: it only makes sense with fd 3 attached.
 const ChildCommand = "child"
 
-// Run is the parent. It returns the container's exit code.
-func Run(image string, argv []string, limits cgroup.Limits) (int, error) {
-	logPID("run")
+// specFD is where the child finds its spec. 0, 1 and 2 are stdio, and
+// ExtraFiles starts numbering after them.
+const specFD = 3
 
-	root, err := rootfsPath(image)
-	if err != nil {
+// Run is the parent half. It returns the container's exit code.
+func Run(s spec.Spec, log io.Writer) (int, error) {
+	fmt.Fprintf(log, "[run] as pid %d\n", os.Getpid())
+	if err := s.Validate(); err != nil {
 		return 0, err
 	}
-	// Fail here, with a clear message, rather than as an EINVAL from
-	// pivot_root inside the child.
-	if err := rootfs.Validate(root); err != nil {
-		return 0, err
-	}
-	uid, gid, err := owner(root)
-	if err != nil {
+	if err := rootfs.Validate(s.Rootfs); err != nil {
 		return 0, err
 	}
 
-	id := newID()
-
-	// snippet:start cgroup
-	// The cgroup exists before the child does, so the child is born in it
-	// and its very first fork already counts against pids.max.
-	group, err := createCgroup(id, limits)
+	// ---------------------------------------------------------- cgroup ---
+	// Created before the child exists, so the child is born inside it and
+	// its very first fork already counts against pids.max. That is what
+	// CLONE_INTO_CGROUP gives us: no window where the limit is not there.
+	group, err := createCgroup(s, log)
 	if err != nil {
 		return 0, err
 	}
 	if group != nil {
-		defer group.Remove()
+		defer func() {
+			if err := group.Remove(); err != nil {
+				fmt.Fprintf(log, "mycontainer: remove cgroup: %v\n", err)
+			}
+		}()
 	}
-	// snippet:end cgroup
 
-	// GidMappingsEnableSetgroups stays false, its default: the kernel
-	// refuses an unprivileged gid_map unless setgroups is denied first,
-	// and os/exec denies it when the field is false.
+	// ------------------------------------------------------------ spec ---
+	// The child gets its instructions over a pipe rather than argv, so the
+	// command line stays readable in ps and the spec can grow without the
+	// two halves drifting apart.
+	specRead, specWrite, err := os.Pipe()
+	if err != nil {
+		return 0, err
+	}
+	if err := s.Encode(specWrite); err != nil {
+		return 0, err
+	}
+	_ = specWrite.Close()
+
+	// ----------------------------------------------------------- clone ---
 	// snippet:start clone
-	cmd := exec.Command("/proc/self/exe", append([]string{ChildCommand, id, root}, argv...)...)
+	// The same binary, again, as "mycontainer child". Everything that
+	// makes it a container and not a process happens inside clone(2),
+	// through SysProcAttr.
+	cmd := exec.Command("/proc/self/exe", ChildCommand)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		// 01-pid: its own process IDs. 02-mnt: its own mount table.
-		// 03-user: its own user IDs, so no sudo. 04-uts: its own hostname.
-		// 05-ipc: its own shared memory, semaphores and message queues.
-		// 06-cgroups: its own view of the cgroup tree, rooted at its own.
-		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUSER |
-			syscall.CLONE_NEWUTS | syscall.CLONE_NEWIPC | syscall.CLONE_NEWCGROUP,
-		// One line each: root inside is the image's owner outside.
-		UidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: uid, Size: 1}},
-		GidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: gid, Size: 1}},
-	}
-	if group != nil {
-		// CLONE_INTO_CGROUP: clone3 puts the child straight into the cgroup.
-		cmd.SysProcAttr.UseCgroupFD = true
-		cmd.SysProcAttr.CgroupFD = group.FD
+	cmd.ExtraFiles = []*os.File{specRead} // the spec, as fd 3
+	cmd.SysProcAttr = sysProcAttr(s, group)
+
+	if err := cmd.Start(); err != nil {
+		return 0, fmt.Errorf("start container: %w", err)
 	}
 	// snippet:end clone
+	_ = specRead.Close()
 
-	return exitCode(cmd.Run())
+	if s.Verbose {
+		fmt.Fprintf(log, "mycontainer: %s is host pid %d\n", s.ID, cmd.Process.Pid)
+	}
+
+	// Ctrl-C, or a kill aimed at this process, belongs to the container.
+	// Forward everything catchable to its PID 1, the way `docker run` does,
+	// and let PID 1 decide what to do with it: our init passes it on to
+	// the command, a bare command as PID 1 mostly ignores it.
+	sigs := make(chan os.Signal, 16)
+	signal.Notify(sigs)
+	defer signal.Stop(sigs)
+	go func() {
+		for sig := range sigs {
+			if s, ok := sig.(syscall.Signal); ok && s != syscall.SIGCHLD {
+				_ = cmd.Process.Signal(s)
+			}
+		}
+	}()
+
+	err = cmd.Wait()
+	var exitErr *exec.ExitError
+	switch {
+	case err == nil:
+		return 0, nil
+	case errors.As(err, &exitErr):
+		return initproc.ExitCode(exitErr.Sys().(syscall.WaitStatus)), nil
+	default:
+		return 0, err
+	}
 }
 
-// Child runs inside the new namespaces as PID 1. args is the container
-// ID, the rootfs path and the command.
-func Child(args []string) error {
-	logPID("child")
-	if len(args) < 3 {
-		return errors.New("child: want an id, a rootfs and a command")
+// sysProcAttr is the whole difference between exec.Command and a
+// container. Six clone flags, a cgroup to be born into, and, when running
+// unprivileged, one line of UID mapping.
+func sysProcAttr(s spec.Spec, group *cgroup.Group) *syscall.SysProcAttr {
+	// snippet:start sysprocattr
+	attr := &syscall.SysProcAttr{
+		Cloneflags: s.Namespaces.CloneFlags(),
+		// If this parent dies, the kernel kills the container. Otherwise a
+		// runtime that is SIGKILLed leaves its container running under the
+		// host's PID 1 with nobody to report to.
+		Pdeathsig: syscall.SIGKILL,
 	}
-	id, root, argv := args[0], args[1], args[2:]
-
-	// snippet:start hostname
-	// Only this container sees it, because of CLONE_NEWUTS.
-	if err := syscall.Sethostname([]byte(id)); err != nil {
-		return fmt.Errorf("sethostname: %w", err)
+	if group != nil {
+		attr.UseCgroupFD = true
+		attr.CgroupFD = group.FD
 	}
-	// snippet:end hostname
-
-	// snippet:start child-pivot
-	// The image becomes /, with its own /proc, /dev and /sys, and the
-	// host's filesystem is detached. Only possible because of CLONE_NEWNS:
-	// without it, this would do the same to the host.
-	if err := rootfs.Pivot(rootfs.Linux{}, root); err != nil {
-		return err
+	if s.Namespaces.User {
+		// One line each: container UID 0 is our own UID. No range, no
+		// newuidmap, no /etc/subuid. Enough to be root in here and nobody
+		// out there.
+		attr.UidMappings = []syscall.SysProcIDMap{
+			{ContainerID: 0, HostID: os.Getuid(), Size: 1},
+		}
+		attr.GidMappings = []syscall.SysProcIDMap{
+			{ContainerID: 0, HostID: os.Getgid(), Size: 1},
+		}
+		attr.GidMappingsEnableSetgroups = false
 	}
-	// snippet:end child-pivot
-
-	// exec, not fork: the command replaces this process and so inherits
-	// PID 1, with everything that will mean later.
-	path, err := exec.LookPath(argv[0])
-	if err != nil {
-		return err
-	}
-	return syscall.Exec(path, argv, os.Environ())
+	// snippet:end sysprocattr
+	return attr
 }
 
-// createCgroup makes /sys/fs/cgroup/mycontainer/<id> and writes the
-// limits into it. As root it goes under the root cgroup. As an ordinary
-// user it has to go under the user's own, delegated cgroup, and if there is
-// none a container that asked for no limits runs without one, while one
-// that asked for limits is refused: a limit that silently did not apply is
+// createCgroup makes the container's cgroup, or explains why it could
+// not. Without limits a missing cgroup is a warning, because a box that
+// does not delegate cgroups to users can still run a container. With
+// limits it is an error, because a limit that silently did not apply is
 // worse than no container.
-func createCgroup(id string, limits cgroup.Limits) (*cgroup.Group, error) {
+func createCgroup(s spec.Spec, log io.Writer) (*cgroup.Group, error) {
 	parent := "/"
 	if os.Geteuid() != 0 {
 		own, err := cgroup.OwnPath()
@@ -136,49 +171,126 @@ func createCgroup(id string, limits cgroup.Limits) (*cgroup.Group, error) {
 		}
 		parent = own
 	}
-	group, err := cgroup.Create(cgroup.Root, parent, id, limits)
+
+	group, err := cgroup.Create(cgroup.Root, parent, s.ID, s.Limits)
 	if err != nil {
-		if len(limits.Files()) == 0 {
+		if len(s.Limits.Files()) == 0 {
+			if s.Verbose {
+				fmt.Fprintf(log, "mycontainer: no cgroup for this container: %v\n", err)
+				fmt.Fprintf(log, "mycontainer: rootless needs a delegated cgroup: systemd-run --user --scope -p Delegate=yes ./mycontainer run ...\n")
+			}
 			return nil, nil
 		}
-		return nil, fmt.Errorf("cgroup: %w (limits need root, or a delegated cgroup)", err)
+		return nil, fmt.Errorf("cgroup: %w", err)
 	}
 	if err := group.Open(); err != nil {
 		_ = group.Remove()
 		return nil, err
 	}
+	if s.Verbose {
+		fmt.Fprintf(log, "mycontainer: cgroup %s\n", group.Path)
+	}
 	return group, nil
 }
 
-// owner is the user and group that own the image. Container root maps to
-// them. Run as yourself, that is you, and the map is one line no setuid
-// helper is needed for. Run with sudo, it is still the image's owner,
-// because root inside has to be able to write to the image, and a
-// capability inside a user namespace means nothing to a file whose owner
-// is not mapped into it.
-func owner(root string) (uid, gid int, err error) {
-	var st syscall.Stat_t
-	if err := syscall.Stat(root, &st); err != nil {
-		return 0, 0, err
-	}
-	if os.Geteuid() != 0 && int(st.Uid) != os.Geteuid() {
-		return 0, 0, fmt.Errorf("%s belongs to uid %d, not you; pull it as yourself (make rootfs)", root, st.Uid)
-	}
-	return int(st.Uid), int(st.Gid), nil
-}
+// Child is the other half. It runs as PID 1 of the new PID namespace, in
+// the new mount namespace, and turns itself into the container.
+func Child() (int, error) {
+	// Capabilities are a property of a thread, not a process. Go schedules
+	// goroutines across threads, so without this the prctl that drops the
+	// bounding set can run on one thread and the fork of the command on
+	// another, and the command starts with every capability intact. It
+	// happened during development, only in the rootless run, and only
+	// sometimes. Never unlocked: this goroutine ends in exec or as init.
+	runtime.LockOSThread()
 
-// rootfsPath is rootfs/<image> under the working directory, the same
-// place the 2025 version looked.
-func rootfsPath(image string) (string, error) {
-	dir, err := os.Getwd()
+	// This process stays resident as the container's init, inside the
+	// container's cgroup, and pids.max counts threads. A Go program starts
+	// several and grows more when it is busy; if it needs one while the
+	// cgroup is full it dies with "failed to create new OS thread", taking
+	// the container with it. One P keeps the runtime small. tini, the C
+	// init Docker ships, has one thread; this is the price of Go here, and
+	// the reason -pids below about 16 is not a good idea.
+	runtime.GOMAXPROCS(1)
+
+	s, err := spec.Decode(os.NewFile(specFD, "spec"))
 	if err != nil {
-		return "", err
+		return 0, err
 	}
-	return filepath.Join(dir, "rootfs", image), nil
+	fmt.Fprintf(os.Stderr, "[child] as pid %d\n", os.Getpid())
+
+	say := func(format string, args ...any) {
+		if s.Verbose {
+			fmt.Fprintf(os.Stderr, "mycontainer[%d]: "+format+"\n", append([]any{os.Getpid()}, args...)...)
+		}
+	}
+	say("child running, namespaces %s", s.Namespaces)
+
+	// snippet:start child
+	// 1. Hostname. Only visible in here, because of CLONE_NEWUTS. If the
+	//    clone flags did not include it, this process shares the host's
+	//    UTS namespace and would rename the host; refuse rather than do
+	//    that, because the flags are the first thing anyone edits.
+	if s.Hostname != "" {
+		if sameNamespace("uts") {
+			return 0, errors.New("refusing to set the hostname: not in a new UTS namespace (is CLONE_NEWUTS in the clone flags?)")
+		}
+		if err := syscall.Sethostname([]byte(s.Hostname)); err != nil {
+			return 0, fmt.Errorf("sethostname: %w", err)
+		}
+		say("hostname %s", s.Hostname)
+	}
+
+	// 2. Filesystem. Only possible in here, because of CLONE_NEWNS.
+	if s.Namespaces.Mount {
+		if err := rootfs.Pivot(rootfs.Linux{}, s.Rootfs); err != nil {
+			return 0, err
+		}
+		say("pivot_root into %s", s.Rootfs)
+	}
+
+	// 3. Capabilities. Root in here is about to mean less than it did.
+	dropped, err := caps.DropBounding(s.Caps)
+	if err != nil {
+		return 0, err
+	}
+	say("dropped %d capabilities, kept %s", dropped, s.Caps)
+
+	// 4. The command, with the container's environment, not the host's.
+	os.Clearenv()
+	for _, kv := range s.Env {
+		if k, v, ok := cutEnv(kv); ok {
+			_ = os.Setenv(k, v)
+		}
+	}
+	if s.Init {
+		say("running %v as a child, staying as init", s.Args)
+		return initproc.Run(s.Args, s.Env)
+	}
+	path, err := exec.LookPath(s.Args[0])
+	if err != nil {
+		return 0, err
+	}
+	say("exec %s as pid 1", path)
+	return 0, syscall.Exec(path, s.Args, s.Env)
+	// snippet:end child
 }
 
-// logPID prints which side is talking and what PID it has. The child says
-// "as pid 1", which is the whole point of 01-pid.
-func logPID(side string) {
-	fmt.Fprintf(os.Stderr, "[%s] as pid %d\n", side, os.Getpid())
+// sameNamespace reports whether this process is in the same namespace of
+// the given kind as the host's PID 1. /proc/<pid>/ns/<kind> is a symlink
+// whose target names the namespace, so two processes share one exactly
+// when the targets match.
+func sameNamespace(kind string) bool {
+	mine, err1 := os.Readlink("/proc/self/ns/" + kind)
+	host, err2 := os.Readlink("/proc/1/ns/" + kind)
+	return err1 == nil && err2 == nil && mine == host
+}
+
+func cutEnv(kv string) (string, string, bool) {
+	for i := 0; i < len(kv); i++ {
+		if kv[i] == '=' {
+			return kv[:i], kv[i+1:], true
+		}
+	}
+	return "", "", false
 }
