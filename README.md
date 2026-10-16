@@ -16,7 +16,7 @@ runtime starts at `01-pid`.
 
 ```bash
 make vm && make vm-shell      # a provisioned Ubuntu 24.04 VM; docs/setup.md for others
-make rootfs                   # pulls ubuntu:24.04 into rootfs/ubuntu
+make rootfs                   # pulls ubuntu:26.04 into rootfs/ubuntu
 ./scripts/check.sh            # the pre-flight
 ```
 
